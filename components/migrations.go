@@ -45,6 +45,8 @@ import (
 	"github.com/coderanger/migrations-operator/webhook"
 )
 
+const targetDigestAnnotation = "migrations.coderanger.net/target-digest"
+
 type migrationsComponent struct{}
 
 func Migrations() *migrationsComponent {
@@ -99,6 +101,68 @@ func deepCopyJSON(src map[string]interface{}, dest map[string]interface{}) error
 		return err
 	}
 	return nil
+}
+
+// getImageIDFromPod extracts the resolved image ID (with digest) from a running pod's status.
+// This allows detecting image changes even when using mutable tags like "latest".
+// Returns the imageID if found, or empty string if not available.
+func getImageIDFromPod(pod *unstructured.Unstructured, containerName string) string {
+	status, ok := pod.UnstructuredContent()["status"].(map[string]interface{})
+	if !ok {
+		return ""
+	}
+	
+	containerStatuses, ok := status["containerStatuses"].([]interface{})
+	if !ok {
+		return ""
+	}
+	
+	for _, cs := range containerStatuses {
+		containerStatus, ok := cs.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		
+		name, ok := containerStatus["name"].(string)
+		if !ok {
+			continue
+		}
+		
+		// If containerName is specified, match it; otherwise use first container
+		if containerName != "" && name != containerName {
+			continue
+		}
+		
+		imageID, ok := containerStatus["imageID"].(string)
+		if ok && imageID != "" {
+			return imageID
+		}
+		
+		// If no specific container requested, return first found
+		if containerName == "" {
+			break
+		}
+	}
+	
+	return ""
+}
+
+// extractDigestFromImageID extracts the digest portion from an imageID.
+// imageID format is typically: docker-pullable://repo/image@sha256:abc123... or repo/image@sha256:abc123...
+// Returns just the sha256:abc123... part, or the full imageID if no @ is found.
+func extractDigestFromImageID(imageID string) string {
+	if idx := strings.LastIndex(imageID, "@"); idx != -1 {
+		return imageID[idx+1:]
+	}
+	// If no @, try to extract after the last colon (for older formats)
+	if idx := strings.LastIndex(imageID, ":"); idx != -1 {
+		// Check if it looks like a digest (sha256:...)
+		suffix := imageID[idx+1:]
+		if strings.HasPrefix(suffix, "sha") {
+			return suffix
+		}
+	}
+	return imageID
 }
 
 func (comp *migrationsComponent) Reconcile(ctx *cu.Context) (cu.Result, error) {
@@ -241,12 +305,42 @@ func (comp *migrationsComponent) Reconcile(ctx *cu.Context) (cu.Result, error) {
 	migrationJobName := obj.Name + "-migrations"
 	migrationJobNamespace := obj.Namespace
 	migrationJobImage := migrationContainer["image"].(string)
+	
+	// Get the actual image digest from the running pod's status.
+	// This allows detecting image changes even with mutable tags like "latest".
+	imageDigest := getImageIDFromPod(templatePod, obj.Spec.Container)
+	if imageDigest == "" {
+		// Pod status not ready yet - wait for it
+		ctx.Log.Info("Pod imageID not available yet, waiting", "pod", templatePod.GetName())
+		return cu.Result{RequeueAfter: 5 * time.Second}, nil
+	}
+	
+	// Extract just the digest for cleaner comparison
+	imageDigest = extractDigestFromImageID(imageDigest)
+	
+	// Validate we have an actual digest (sha256:...), not just a tag
+	if !strings.HasPrefix(imageDigest, "sha256:") && !strings.HasPrefix(imageDigest, "sha384:") && !strings.HasPrefix(imageDigest, "sha512:") {
+		ctx.Log.Info("Invalid digest format, waiting for proper imageID", "imageDigest", imageDigest, "pod", templatePod.GetName())
+		return cu.Result{RequeueAfter: 5 * time.Second}, nil
+	}
+	
+	// Log the image info for debugging
+	ctx.Log.Info("Migration image detection", 
+		"imageTag", migrationJobImage, 
+		"imageDigest", imageDigest,
+		"templatePod", templatePod.GetName())
+	
 	migrationJob := &unstructured.Unstructured{}
 	migrationJob.SetAPIVersion("batch/v1")
 	migrationJob.SetKind("Job")
 	migrationJob.SetName(migrationJobName)
 	migrationJob.SetNamespace(migrationJobNamespace)
 	migrationJob.SetLabels(obj.Labels)
+	// Annotate the job with the target digest so we can detect staleness
+	// even with mutable tags like "latest"
+	migrationJob.SetAnnotations(map[string]string{
+		targetDigestAnnotation: imageDigest,
+	})
 	migrationJob.UnstructuredContent()["spec"] = map[string]interface{}{
 		"template": map[string]interface{}{
 			"metadata": map[string]interface{}{
@@ -262,13 +356,21 @@ func (comp *migrationsComponent) Reconcile(ctx *cu.Context) (cu.Result, error) {
 	}
 
 	// Check if we're already up to date.
+	// We compare using the image DIGEST (not tag) to detect changes with mutable tags like "latest"
 	uncachedObj := &migrationsv1beta1.Migrator{}
 	err = ctx.UncachedClient.Get(ctx, types.NamespacedName{Name: obj.Name, Namespace: obj.Namespace}, uncachedObj)
 	if err != nil {
 		return cu.Result{}, errors.Wrap(err, "error getting latest migrator for status")
 	}
-	if uncachedObj.Status.LastSuccessfulMigration == migrationJobImage {
-		ctx.Conditions.SetfTrue(comp.GetReadyCondition(), "MigrationsUpToDate", "Migration %s already run", migrationJobImage)
+	
+	ctx.Log.Info("Checking migration status", 
+		"currentDigest", imageDigest, 
+		"lastSuccessfulMigration", uncachedObj.Status.LastSuccessfulMigration,
+		"isUpToDate", uncachedObj.Status.LastSuccessfulMigration == imageDigest)
+	
+	if uncachedObj.Status.LastSuccessfulMigration == imageDigest {
+		ctx.Log.Info("Migration already up to date, skipping", "digest", imageDigest)
+		ctx.Conditions.SetfTrue(comp.GetReadyCondition(), "MigrationsUpToDate", "Migration for digest %s already run (image: %s)", imageDigest, migrationJobImage)
 		return cu.Result{}, nil
 	}
 
@@ -277,6 +379,7 @@ func (comp *migrationsComponent) Reconcile(ctx *cu.Context) (cu.Result, error) {
 	if err != nil {
 		if kerrors.IsNotFound(err) {
 			// Try to start the migrations.
+			ctx.Log.Info("No existing migration job found, creating new one", "jobName", migrationJobName, "image", migrationJobImage)
 			err = ctx.Client.Create(ctx, migrationJob, &client.CreateOptions{FieldManager: ctx.FieldManager})
 			if err != nil {
 				// Possible race condition, try again.
@@ -297,29 +400,81 @@ func (comp *migrationsComponent) Reconcile(ctx *cu.Context) (cu.Result, error) {
 	if len(existingJob.Spec.Template.Spec.Containers) > 0 {
 		existingImage = existingJob.Spec.Template.Spec.Containers[0].Image
 	}
-	if existingImage == "" || existingImage != migrationJobImage {
+	
+	// Check digest annotation to detect staleness with mutable tags like "latest"
+	existingJobDigest := existingJob.Annotations[targetDigestAnnotation]
+	
+	ctx.Log.Info("Found existing migration job", 
+		"jobName", existingJob.Name,
+		"jobImage", existingImage,
+		"jobDigest", existingJobDigest,
+		"expectedImage", migrationJobImage,
+		"expectedDigest", imageDigest,
+		"succeeded", existingJob.Status.Succeeded,
+		"failed", existingJob.Status.Failed,
+		"active", existingJob.Status.Active)
+	
+	// Job is stale if:
+	// 1. Image tag changed (different app), OR
+	// 2. Image tag is the same but digest changed (mutable tag like "latest"), OR
+	// 3. Job completed but was for a different digest (handles old jobs without the annotation)
+	imageTagChanged := existingImage == "" || existingImage != migrationJobImage
+	digestChanged := existingJobDigest != "" && existingJobDigest != imageDigest
+	completedWithWrongDigest := existingJobDigest == "" && existingJob.Status.Succeeded > 0
+	
+	if imageTagChanged || digestChanged || completedWithWrongDigest {
+		reason := "image tag changed"
+		if digestChanged {
+			reason = fmt.Sprintf("digest changed: job has %s, need %s", existingJobDigest, imageDigest)
+		} else if completedWithWrongDigest {
+			reason = fmt.Sprintf("completed job has no digest annotation, need %s", imageDigest)
+		}
+		ctx.Log.Info("Deleting stale migration job", "jobName", existingJob.Name, "reason", reason)
 		// Old, stale migration. Remove it and try again.
 		policy := metav1.DeletePropagationForeground
 		err = ctx.Client.Delete(ctx, existingJob, &client.DeleteOptions{PropagationPolicy: &policy})
 		if err != nil {
 			return cu.Result{}, errors.Wrapf(err, "error deleting stale migration job %s/%s", existingJob.Namespace, existingJob.Name)
 		}
-		ctx.Events.Eventf(obj, "Normal", "StaleJob", "Deleted stale migration job %s/%s (%s)", migrationJobNamespace, migrationJobName, existingImage)
-		ctx.Conditions.SetfFalse(comp.GetReadyCondition(), "StaleJob", "Deleted stale migration job %s/%s (%s)", migrationJobNamespace, migrationJobName, existingImage)
+		ctx.Events.Eventf(obj, "Normal", "StaleJob", "Deleted stale migration job %s/%s (%s): %s", migrationJobNamespace, migrationJobName, existingImage, reason)
+		ctx.Conditions.SetfFalse(comp.GetReadyCondition(), "StaleJob", "Deleted stale migration job %s/%s (%s): %s", migrationJobNamespace, migrationJobName, existingImage, reason)
 		return cu.Result{RequeueAfter: 1 * time.Second, SkipRemaining: true}, nil
 	}
 
 	// Check if the job succeeded.
 	if existingJob.Status.Succeeded > 0 {
-		// Success! Update LastSuccessfulMigration and delete the job.
-		err = ctx.Client.Delete(ctx.Context, existingJob, client.PropagationPolicy(metav1.DeletePropagationBackground))
-		if err != nil {
-			return cu.Result{}, errors.Wrapf(err, "error deleting successful migration job %s/%s", existingJob.Namespace, existingJob.Name)
+		// If we get here, the job's digest annotation matches imageDigest,
+		// so the migration actually ran with the correct image.
+		
+		// Check if we already recorded this migration success
+		if uncachedObj.Status.LastSuccessfulMigration == imageDigest {
+			// Status already saved, now clean up the job
+			ctx.Log.Info("Migration already recorded, cleaning up job", "digest", imageDigest)
+			err = ctx.Client.Delete(ctx.Context, existingJob, client.PropagationPolicy(metav1.DeletePropagationBackground))
+			if err != nil && !kerrors.IsNotFound(err) {
+				return cu.Result{}, errors.Wrapf(err, "error deleting successful migration job %s/%s", existingJob.Namespace, existingJob.Name)
+			}
+			ctx.Conditions.SetfTrue(comp.GetReadyCondition(), "MigrationsUpToDate", "Migration for digest %s completed", imageDigest)
+			return cu.Result{}, nil
 		}
-		ctx.Events.Eventf(obj, "Normal", "MigrationsSucceeded", "Migration job %s/%s using image %s succeeded", existingJob.Namespace, existingJob.Name, existingImage)
-		ctx.Conditions.SetfTrue(comp.GetReadyCondition(), "MigrationsSucceeded", "Migration job %s/%s using image %s succeeded", existingJob.Namespace, existingJob.Name, existingImage)
-		obj.Status.LastSuccessfulMigration = migrationJobImage
-		return cu.Result{}, nil
+		
+		// Success! Need to update LastSuccessfulMigration status.
+		// We store the IMAGE DIGEST (not tag) to properly detect future image changes.
+		ctx.Log.Info("Migration succeeded, updating status", "digest", imageDigest)
+		obj.Status.LastSuccessfulMigration = imageDigest
+		
+		// Explicitly update the status subresource to ensure it persists
+		err = ctx.Client.Status().Update(ctx.Context, obj)
+		if err != nil {
+			ctx.Log.Error(err, "Failed to update Migrator status", "digest", imageDigest)
+			return cu.Result{Requeue: true}, nil
+		}
+		
+		ctx.Events.Eventf(obj, "Normal", "MigrationsSucceeded", "Migration job %s/%s using image %s (digest: %s) succeeded", existingJob.Namespace, existingJob.Name, existingImage, imageDigest)
+		ctx.Conditions.SetfTrue(comp.GetReadyCondition(), "MigrationsSucceeded", "Migration job %s/%s using image %s (digest: %s) succeeded", existingJob.Namespace, existingJob.Name, existingImage, imageDigest)
+		
+		// Requeue to clean up the job after status is confirmed persisted
+		return cu.Result{RequeueAfter: 2 * time.Second}, nil
 	}
 
 	// ... Or if the job failed.
