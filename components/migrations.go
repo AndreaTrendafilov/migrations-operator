@@ -497,9 +497,12 @@ func (comp *migrationsComponent) Reconcile(ctx *cu.Context) (cu.Result, error) {
 		
 		ctx.Events.Eventf(obj, "Normal", "MigrationsSucceeded", "Migration job %s/%s using image %s (digest: %s) succeeded", existingJob.Namespace, existingJob.Name, existingImage, imageDigest)
 		ctx.Conditions.SetfTrue(comp.GetReadyCondition(), "MigrationsSucceeded", "Migration job %s/%s using image %s (digest: %s) succeeded", existingJob.Namespace, existingJob.Name, existingImage, imageDigest)
-		
-		// Requeue to clean up the job after status is confirmed persisted
-		return cu.Result{RequeueAfter: 2 * time.Second}, nil
+
+		err = ctx.Client.Delete(ctx.Context, existingJob, client.PropagationPolicy(metav1.DeletePropagationBackground))
+		if err != nil && !kerrors.IsNotFound(err) {
+			return cu.Result{}, errors.Wrapf(err, "error deleting successful migration job %s/%s", existingJob.Namespace, existingJob.Name)
+		}
+		return cu.Result{}, nil
 	}
 
 	// ... Or if the job failed.
