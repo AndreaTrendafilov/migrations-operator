@@ -388,6 +388,18 @@ func (comp *migrationsComponent) Reconcile(ctx *cu.Context) (cu.Result, error) {
 	
 	if uncachedObj.Status.LastSuccessfulMigration == imageDigest {
 		ctx.Log.Info("Migration already up to date, skipping", "digest", imageDigest)
+		// Status may have been written by a concurrent reconcile while a succeeded Job
+		// still exists (e.g. status update conflict on a previous pass).
+		cleanupJob := &batchv1.Job{}
+		if err := ctx.Client.Get(ctx, types.NamespacedName{Name: migrationJobName, Namespace: migrationJobNamespace}, cleanupJob); err == nil {
+			if cleanupJob.Status.Succeeded > 0 {
+				if delErr := ctx.Client.Delete(ctx.Context, cleanupJob, client.PropagationPolicy(metav1.DeletePropagationBackground)); delErr != nil && !kerrors.IsNotFound(delErr) {
+					return cu.Result{}, errors.Wrapf(delErr, "error deleting migration job %s/%s", migrationJobNamespace, migrationJobName)
+				}
+			}
+		} else if !kerrors.IsNotFound(err) {
+			return cu.Result{}, errors.Wrapf(err, "error getting migration job %s/%s", migrationJobNamespace, migrationJobName)
+		}
 		ctx.Conditions.SetfTrue(comp.GetReadyCondition(), "MigrationsUpToDate", "Migration for digest %s already run (image: %s)", imageDigest, migrationJobImage)
 		return cu.Result{}, nil
 	}
@@ -485,17 +497,25 @@ func (comp *migrationsComponent) Reconcile(ctx *cu.Context) (cu.Result, error) {
 		
 		// Success! Need to update LastSuccessfulMigration status.
 		// We store the IMAGE DIGEST (not tag) to properly detect future image changes.
+		// Use a fresh read for the status write: ctx.Object (`obj`) can lag behind other
+		// writers (e.g. readyStatus) and Status().Update(obj) hits resourceVersion conflicts.
 		ctx.Log.Info("Migration succeeded, updating status", "digest", imageDigest)
-		obj.Status.LastSuccessfulMigration = imageDigest
-		
-		// Explicitly update the status subresource to ensure it persists
-		err = ctx.Client.Status().Update(ctx.Context, obj)
+		fresh := &migrationsv1beta1.Migrator{}
+		if err = ctx.UncachedClient.Get(ctx, types.NamespacedName{Name: obj.Name, Namespace: obj.Namespace}, fresh); err != nil {
+			return cu.Result{}, errors.Wrap(err, "error re-fetching migrator for status update")
+		}
+		fresh.Status.LastSuccessfulMigration = imageDigest
+		err = ctx.Client.Status().Update(ctx.Context, fresh)
 		if err != nil {
+			if kerrors.IsConflict(err) {
+				ctx.Log.Info("Migrator status update conflict, will retry", "digest", imageDigest)
+				return cu.Result{Requeue: true}, nil
+			}
 			ctx.Log.Error(err, "Failed to update Migrator status", "digest", imageDigest)
 			return cu.Result{Requeue: true}, nil
 		}
 		
-		ctx.Events.Eventf(obj, "Normal", "MigrationsSucceeded", "Migration job %s/%s using image %s (digest: %s) succeeded", existingJob.Namespace, existingJob.Name, existingImage, imageDigest)
+		ctx.Events.Eventf(fresh, "Normal", "MigrationsSucceeded", "Migration job %s/%s using image %s (digest: %s) succeeded", existingJob.Namespace, existingJob.Name, existingImage, imageDigest)
 		ctx.Conditions.SetfTrue(comp.GetReadyCondition(), "MigrationsSucceeded", "Migration job %s/%s using image %s (digest: %s) succeeded", existingJob.Namespace, existingJob.Name, existingImage, imageDigest)
 
 		err = ctx.Client.Delete(ctx.Context, existingJob, client.PropagationPolicy(metav1.DeletePropagationBackground))
