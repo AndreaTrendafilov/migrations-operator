@@ -567,7 +567,7 @@ func (*migrationsComponent) findOwners(ctx *cu.Context, obj *unstructured.Unstru
 	return owners, nil
 }
 
-func (_ *migrationsComponent) findSpecFor(ctx *cu.Context, obj *unstructured.Unstructured) map[string]interface{} {
+func (*migrationsComponent) findSpecFor(ctx *cu.Context, obj *unstructured.Unstructured) map[string]interface{} {
 	gvk := obj.GetObjectKind().GroupVersionKind()
 	switch fmt.Sprintf("%s/%s", gvk.Group, gvk.Kind) {
 	case "/Pod":

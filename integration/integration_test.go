@@ -23,8 +23,7 @@ import (
 
 	cu "github.com/coderanger/controller-utils"
 	. "github.com/onsi/ginkgo"
-
-	// . "github.com/onsi/gomega"
+	. "github.com/onsi/gomega"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -46,8 +45,8 @@ var _ = Describe("Integration", func() {
 		if extName == "" || image == "" {
 			Skip("Integration tests require $INTEGRATION_EXTERNAL_NAME and $INTEGRATION_IMAGE_NAME")
 		}
-		os.Setenv("API_HOSTNAME", fmt.Sprintf("%s:5000", extName))
-		os.Setenv("WAITER_IMAGE", image)
+		Expect(os.Setenv("API_HOSTNAME", fmt.Sprintf("%s:5000", extName))).To(Succeed())
+		Expect(os.Setenv("WAITER_IMAGE", image)).To(Succeed())
 
 		helper = suiteHelper.MustStart(
 			controllers.Migrator,
