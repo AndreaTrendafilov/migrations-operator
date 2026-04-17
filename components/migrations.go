@@ -18,8 +18,11 @@ package components
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -45,7 +48,19 @@ import (
 	"github.com/coderanger/migrations-operator/webhook"
 )
 
-const targetDigestAnnotation = "migrations.coderanger.net/target-digest"
+const (
+	targetDigestAnnotation = "migrations.coderanger.net/target-digest"
+	// envImageDigestFallback enables a deterministic digest when the CRI never
+	// populates pod status (e.g. envtest). Never set in production.
+	envImageDigestFallback = "MIGRATIONS_OPERATOR_IMAGE_DIGEST_FALLBACK"
+)
+
+// syntheticDigestFromImageRef returns a stable sha256-prefixed fingerprint of
+// the image reference for environments without kubelet/CRI (envtest).
+func syntheticDigestFromImageRef(image string) string {
+	sum := sha256.Sum256([]byte(image))
+	return "sha256:" + hex.EncodeToString(sum[:])
+}
 
 type migrationsComponent struct{}
 
@@ -305,20 +320,22 @@ func (comp *migrationsComponent) Reconcile(ctx *cu.Context) (cu.Result, error) {
 	migrationJobName := obj.Name + "-migrations"
 	migrationJobNamespace := obj.Namespace
 	migrationJobImage := migrationContainer["image"].(string)
-	
-	// Get the actual image digest from the running pod's status.
-	// This allows detecting image changes even with mutable tags like "latest".
-	imageDigest := getImageIDFromPod(templatePod, obj.Spec.Container)
-	if imageDigest == "" {
-		// Pod status not ready yet - wait for it
+
+	// Prefer the resolved image digest from the pod (real clusters / kubelet).
+	// envtest has no kubelet, so imageID is never set — tests enable
+	// MIGRATIONS_OPERATOR_IMAGE_DIGEST_FALLBACK=synthetic (see Makefile).
+	var imageDigest string
+	if raw := getImageIDFromPod(templatePod, obj.Spec.Container); raw != "" {
+		imageDigest = extractDigestFromImageID(raw)
+	} else if os.Getenv(envImageDigestFallback) == "synthetic" {
+		imageDigest = syntheticDigestFromImageRef(migrationJobImage)
+		ctx.Log.Info("Using synthetic digest from image ref (no kubelet / test mode)",
+			"pod", templatePod.GetName(), "image", migrationJobImage)
+	} else {
 		ctx.Log.Info("Pod imageID not available yet, waiting", "pod", templatePod.GetName())
 		return cu.Result{RequeueAfter: 5 * time.Second}, nil
 	}
-	
-	// Extract just the digest for cleaner comparison
-	imageDigest = extractDigestFromImageID(imageDigest)
-	
-	// Validate we have an actual digest (sha256:...), not just a tag
+
 	if !strings.HasPrefix(imageDigest, "sha256:") && !strings.HasPrefix(imageDigest, "sha384:") && !strings.HasPrefix(imageDigest, "sha512:") {
 		ctx.Log.Info("Invalid digest format, waiting for proper imageID", "imageDigest", imageDigest, "pod", templatePod.GetName())
 		return cu.Result{RequeueAfter: 5 * time.Second}, nil

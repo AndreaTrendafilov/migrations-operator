@@ -41,8 +41,9 @@ jobs:
           set -euo pipefail
           os=$(go env GOOS)
           arch=$(go env GOARCH)
-          # Match k8s.io/client-go in go.mod; old storage.googleapis.com/kubebuilder-tools URLs are dead (see kubebuilder discussion #4082).
-          k8s_minor=1.25.0
+          # Newer kube-apiserver for API fields used in tests (e.g. initContainer restartPolicy).
+          # Old storage.googleapis.com/kubebuilder-tools URLs are dead (kubebuilder discussion #4082).
+          k8s_minor=1.33.0
           tag="envtest-v${k8s_minor}"
           url="https://github.com/kubernetes-sigs/controller-tools/releases/download/${tag}/${tag}-${os}-${arch}.tar.gz"
           curl -fsSL "$url" | tar -xz -C /tmp/
