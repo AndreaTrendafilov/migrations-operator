@@ -19,6 +19,7 @@ package http
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
@@ -43,7 +44,9 @@ func (h *readyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 	} else {
-		fmt.Fprintf(w, "%v", ready)
+		if _, werr := fmt.Fprintf(w, "%v", ready); werr != nil {
+			log.Printf("write ready response: %v", werr)
+		}
 	}
 }
 

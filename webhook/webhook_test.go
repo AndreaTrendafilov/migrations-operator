@@ -35,8 +35,8 @@ var _ = Describe("InitInjector", func() {
 	var helper *cu.FunctionalHelper
 
 	BeforeEach(func() {
-		os.Setenv("API_HOSTNAME", "migrations-operator.migration-operator.svc")
-		os.Setenv("WAITER_IMAGE", "migrations-operator:latest")
+		Expect(os.Setenv("API_HOSTNAME", "migrations-operator.migration-operator.svc")).To(Succeed())
+		Expect(os.Setenv("WAITER_IMAGE", "migrations-operator:latest")).To(Succeed())
 		helper = suiteHelper.MustStart(InitInjector)
 	})
 

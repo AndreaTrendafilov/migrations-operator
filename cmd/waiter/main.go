@@ -62,7 +62,11 @@ func migratorReady(targetImage, migratorNamespace, migratorName, apiUrl string) 
 	if err != nil {
 		return false, err
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if cerr := resp.Body.Close(); cerr != nil {
+			log.Printf("close response body: %v", cerr)
+		}
+	}()
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return false, err

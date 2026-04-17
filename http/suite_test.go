@@ -48,7 +48,7 @@ var _ = BeforeSuite(func(done Done) {
 
 	// Set up where the API server will listen.
 	port := 40000 + rand.Intn(10000)
-	os.Setenv("API_LISTEN", fmt.Sprintf("localhost:%d", port))
+	Expect(os.Setenv("API_LISTEN", fmt.Sprintf("localhost:%d", port))).To(Succeed())
 	url = fmt.Sprintf("http://localhost:%d/", port)
 
 	By("bootstrapping test environment")

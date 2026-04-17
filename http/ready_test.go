@@ -61,7 +61,9 @@ var _ = Describe("Ready API", func() {
 		resp, err := http.Post(url+"api/ready", "application/json", bytes.NewBuffer(data))
 		Expect(err).ToNot(HaveOccurred())
 		Expect(resp.StatusCode).To(Equal(200))
-		defer resp.Body.Close()
+		defer func() {
+			Expect(resp.Body.Close()).To(Succeed())
+		}()
 		body, err := io.ReadAll(resp.Body)
 		Expect(err).ToNot(HaveOccurred())
 		return string(body) == "true"
