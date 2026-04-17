@@ -29,6 +29,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 
 	migrationsv1beta1 "github.com/coderanger/migrations-operator/api/v1beta1"
+	"github.com/coderanger/migrations-operator/components"
 	"github.com/coderanger/migrations-operator/webhook"
 )
 
@@ -88,7 +89,7 @@ var _ = Describe("Migrator controller", func() {
 
 		// Make sure the migrator is ready.
 		c.EventuallyGetName("testing", migrator, c.EventuallyReady())
-		Expect(migrator.Status.LastSuccessfulMigration).To(Equal("myapp:v1"))
+		Expect(migrator.Status.LastSuccessfulMigration).To(Equal(components.SyntheticDigestFromImageRef("myapp:v1")))
 
 		// Make sure the job doesn't come back.
 		Consistently(func() error {
@@ -110,6 +111,6 @@ var _ = Describe("Migrator controller", func() {
 
 		// Make sure the migrator is ready, again.
 		c.EventuallyGetName("testing", migrator, c.EventuallyReady())
-		Expect(migrator.Status.LastSuccessfulMigration).To(Equal("myapp:v2"))
+		Expect(migrator.Status.LastSuccessfulMigration).To(Equal(components.SyntheticDigestFromImageRef("myapp:v2")))
 	})
 })

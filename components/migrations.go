@@ -55,9 +55,10 @@ const (
 	envImageDigestFallback = "MIGRATIONS_OPERATOR_IMAGE_DIGEST_FALLBACK"
 )
 
-// syntheticDigestFromImageRef returns a stable sha256-prefixed fingerprint of
-// the image reference for environments without kubelet/CRI (envtest).
-func syntheticDigestFromImageRef(image string) string {
+// SyntheticDigestFromImageRef returns a stable sha256-prefixed fingerprint of
+// the image reference. Used when MIGRATIONS_OPERATOR_IMAGE_DIGEST_FALLBACK=synthetic
+// (envtest); tests may call this to assert on LastSuccessfulMigration.
+func SyntheticDigestFromImageRef(image string) string {
 	sum := sha256.Sum256([]byte(image))
 	return "sha256:" + hex.EncodeToString(sum[:])
 }
@@ -328,7 +329,7 @@ func (comp *migrationsComponent) Reconcile(ctx *cu.Context) (cu.Result, error) {
 	if raw := getImageIDFromPod(templatePod, obj.Spec.Container); raw != "" {
 		imageDigest = extractDigestFromImageID(raw)
 	} else if os.Getenv(envImageDigestFallback) == "synthetic" {
-		imageDigest = syntheticDigestFromImageRef(migrationJobImage)
+		imageDigest = SyntheticDigestFromImageRef(migrationJobImage)
 		ctx.Log.Info("Using synthetic digest from image ref (no kubelet / test mode)",
 			"pod", templatePod.GetName(), "image", migrationJobImage)
 	} else {
@@ -437,8 +438,15 @@ func (comp *migrationsComponent) Reconcile(ctx *cu.Context) (cu.Result, error) {
 	// 3. Job completed but was for a different digest (handles old jobs without the annotation)
 	imageTagChanged := existingImage == "" || existingImage != migrationJobImage
 	digestChanged := existingJobDigest != "" && existingJobDigest != imageDigest
+	// Succeeded jobs without digest annotation are unsafe for mutable tags in production.
+	// In synthetic/envtest mode the digest is derived only from the image string, so a
+	// succeeded job for the same image ref is never "wrong digest".
 	completedWithWrongDigest := existingJobDigest == "" && existingJob.Status.Succeeded > 0
-	
+	if completedWithWrongDigest && os.Getenv(envImageDigestFallback) == "synthetic" &&
+		existingImage != "" && existingImage == migrationJobImage {
+		completedWithWrongDigest = false
+	}
+
 	if imageTagChanged || digestChanged || completedWithWrongDigest {
 		reason := "image tag changed"
 		if digestChanged {
